@@ -338,12 +338,26 @@ int main(void) {{
         rclol_cpuid_trace_spoof(beyond[i], 0u, &a, &b, &c, &d);
         assert(a == 2600u && b == 4500u && c == 100u && d == 0u);
     }}
-    // The hypervisor range and the feature leaves pass through.
+    // The hypervisor range passes through unchanged.
     a = b = c = d = 0x12345678u;
     rclol_cpuid_trace_spoof(0x40000000u, 0u, &a, &b, &c, &d);
     assert(a == 0x12345678u && b == 0x12345678u && c == 0x12345678u && d == 0x12345678u);
+
+    // Leaf 7 keeps <= AVX2 capability bits (BMI1, AVX2, BMI2, ADX, RDSEED)
+    // while clearing AVX-512 extensions and subleaf >= 1 for i7-9750H.
+    a = 1u;
+    b = (1u << 3) | (1u << 5) | (1u << 8) | (1u << 16) | (1u << 17) | (1u << 18) | (1u << 19)
+        | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);
+    c = (1u << 1) | (1u << 6) | (1u << 11) | (1u << 12) | (1u << 14) | (1u << 22);
+    d = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 23) | (1u << 26);
     rclol_cpuid_trace_spoof(7u, 0u, &a, &b, &c, &d);
-    assert(a == 0x12345678u && b == 0x12345678u && c == 0x12345678u && d == 0x12345678u);
+    assert(a == 0u);
+    assert(b == ((1u << 3) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19)));
+    assert(c == (1u << 22));
+    assert(d == (1u << 26));
+    a = b = c = d = 0xffffffffu;
+    rclol_cpuid_trace_spoof(7u, 1u, &a, &b, &c, &d);
+    assert(a == 0u && b == 0u && c == 0u && d == 0u);
 
     // Leaf 0x80000001: AMD extended signature and package type cleared;
     // 0x80000005 (AMD L1 caches) is reserved on Intel.

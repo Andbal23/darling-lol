@@ -298,9 +298,22 @@ int main(int argc, char** argv) {
     }
     {
         unsigned o[4], ref[4];
+        const unsigned avx512_ebx = (1u << 16) | (1u << 17) | (1u << 21)
+            | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 30) | (1u << 31);
+        const unsigned avx512_ecx = (1u << 1) | (1u << 6) | (1u << 11) | (1u << 12) | (1u << 14);
+        const unsigned avx512_edx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 23);
         rclol_test_cpuid(7, 0, o);
         ref_cpuid(7, 0, ref);
-        CHECK(memcmp(o, ref, sizeof(o)) == 0, "fake: leaf 7 passes through unchanged");
+        CHECK(o[0] == 0u, "fake: leaf 7 subleaf 0 max subleaf is 0");
+        CHECK((o[1] & avx512_ebx) == 0u && (o[2] & avx512_ecx) == 0u && (o[3] & avx512_edx) == 0u,
+              "fake: leaf 7 masks AVX-512 feature bits");
+        CHECK((o[1] & ~avx512_ebx) == (ref[1] & ~avx512_ebx)
+              && (o[2] & ~avx512_ecx) == (ref[2] & ~avx512_ecx)
+              && (o[3] & ~avx512_edx) == (ref[3] & ~avx512_edx),
+              "fake: leaf 7 keeps non-AVX-512 host capability bits");
+        rclol_test_cpuid(7, 1, o);
+        CHECK(o[0] == 0u && o[1] == 0u && o[2] == 0u && o[3] == 0u,
+              "fake: leaf 7 subleaf 1 is zero");
     }
     rclol_cpuid_trace_set_fake(0);
     {

@@ -376,6 +376,64 @@ static void require_byname(const char* full_name, int expected) {
     require_value(entry, expected);
 }
 
+static unsigned long long quad_byname(const char* full_name) {
+    const struct known_sysctl* unspec = NULL;
+    for (const struct known_sysctl* entry = sysctls_unspec; entry->oid != -1; ++entry) {
+        if (strcmp(entry->name, "name_to_oid") == 0)
+            unspec = entry;
+    }
+    if (unspec == NULL) {
+        fprintf(stderr, "HOST_SYSCTL_CPU pass=0 error=name_to_oid missing\n");
+        exit(1);
+    }
+    int oid[4] = { 0 };
+    unsigned long len = sizeof(oid);
+    long rc = unspec->handler(NULL, 0, oid, &len, (void*)full_name, strlen(full_name));
+    if (rc != 0 || len < 2 * sizeof(int) || oid[0] != 6) {
+        fprintf(stderr, "HOST_SYSCTL_CPU pass=0 error=name_to_oid %s rc=%ld\n", full_name, rc);
+        exit(1);
+    }
+    const struct known_sysctl* node = NULL;
+    for (const struct known_sysctl* probe = sysctls_hw; probe->oid != -1; ++probe) {
+        if (probe->oid == oid[1]) {
+            node = probe;
+            break;
+        }
+    }
+    if (node == NULL) {
+        fprintf(stderr, "HOST_SYSCTL_CPU pass=0 error=unknown oid for %s\n", full_name);
+        exit(1);
+    }
+    if (len == 3 * sizeof(int)) {
+        const struct known_sysctl* child = NULL;
+        for (const struct known_sysctl* probe = node->subctls; probe->oid != -1; ++probe) {
+            if (probe->oid == oid[2]) {
+                child = probe;
+                break;
+            }
+        }
+        if (child == NULL) {
+            fprintf(stderr, "HOST_SYSCTL_CPU pass=0 error=unknown sub-oid for %s\n", full_name);
+            exit(1);
+        }
+        return (unsigned long long)(unsigned int)int_value(child);
+    }
+    unsigned long qlen = 0;
+    rc = node->handler(NULL, 0, NULL, &qlen, NULL, 0);
+    if (rc != 0 || qlen != sizeof(unsigned long long)) {
+        fprintf(stderr, "HOST_SYSCTL_CPU pass=0 error=%s quad size rc=%ld len=%lu\n", full_name, rc, qlen);
+        exit(1);
+    }
+    unsigned long long value = 0;
+    qlen = sizeof(value);
+    rc = node->handler(NULL, 0, &value, &qlen, NULL, 0);
+    if (rc != 0) {
+        fprintf(stderr, "HOST_SYSCTL_CPU pass=0 error=%s quad call rc=%ld\n", full_name, rc);
+        exit(1);
+    }
+    return value;
+}
+
 // ---------------------------------------------------------------------------
 // machdep.cpu.* (sysctl_machdep.c): the CPU identity node. In the host profile
 // every value is the host's own cpuid view; in the compat profile they come
@@ -625,6 +683,35 @@ int main(int argc, char** argv) {
     if (compat) {
         require_value(find_machdep("core_count"), 6);
         require_value(find_machdep("thread_count"), 12);
+        require_byname("hw.cpufamily", 0x0f817246);
+        require_byname("hw.cpusubfamily", 0);
+        require_byname("hw.packages", 1);
+        require_byname("hw.cachelinesize_compat", 64);
+        require_byname("hw.l1icachesize_compat", 32768);
+        require_byname("hw.l1dcachesize_compat", 32768);
+        require_byname("hw.l2cachesize_compat", 262144);
+        require_byname("hw.l3cachesize_compat", 12582912);
+        require_byname("hw.tbfrequency_compat", 1000000000);
+        if (quad_byname("hw.cachelinesize") != 64ULL ||
+            quad_byname("hw.l1icachesize") != 32768ULL ||
+            quad_byname("hw.l1dcachesize") != 32768ULL ||
+            quad_byname("hw.l2cachesize") != 262144ULL ||
+            quad_byname("hw.l3cachesize") != 12582912ULL ||
+            quad_byname("hw.tbfrequency") != 1000000000ULL) {
+            fprintf(stderr, "HOST_SYSCTL_CPU pass=0 error=compat quad cache/tb mismatch\n");
+            return 1;
+        }
+        static const char* const no_avx512[] = {
+            "hw.optional.avx512f", "hw.optional.avx512cd", "hw.optional.avx512dq",
+            "hw.optional.avx512bw", "hw.optional.avx512vl", "hw.optional.avx512ifma",
+            "hw.optional.avx512vbmi",
+        };
+        for (size_t i = 0; i < sizeof(no_avx512) / sizeof(no_avx512[0]); ++i) {
+            if (quad_byname(no_avx512[i]) != 0ULL) {
+                fprintf(stderr, "HOST_SYSCTL_CPU pass=0 error=%s nonzero in compat\n", no_avx512[i]);
+                return 1;
+            }
+        }
     }
 
     printf("HOST_SYSCTL_CPU pass=1 mode=%s ncpu=%d active=%d logicalcpu=%d logicalcpu_max=%d physicalcpu=%d physicalcpu_max=%d model=%s\n",

@@ -209,9 +209,17 @@ and 16 GiB). An NVIDIA card is presented as the `Radeon Pro 5500M` too: no Mac
 that runs macOS 14 has an NVIDIA GPU, and the game's rendering goes through the
 same Metal-to-Vulkan layer on every vendor. `compat.gpu.name=host` keeps the real
 card name and IDs while the rest of the profile stays compat. The cache sysctls
-(`hw.cacheconfig`, `hw.cachesize`) and the game's cache and topology `cpuid`
-leaves report the i7-9750H's 6 cores / 12 threads and its 32 KiB / 256 KiB /
-12 MiB caches, whatever the host CPU. `profile=host` reports the real host CPU,
+(`hw.cacheconfig`, `hw.cachesize`, `hw.cachelinesize`, `hw.l1icachesize`,
+`hw.l1dcachesize`, `hw.l2cachesize`, `hw.l3cachesize`), CPU family/feature
+sysctls (`hw.cpufamily`, `hw.cpusubfamily`, `hw.tbfrequency`, `hw.packages`,
+`hw.optional.avx512*`), commpage fields (`_COMM_PAGE_CPUFAMILY`,
+`_COMM_PAGE_CACHE_LINESIZE`), and the game's cache, feature and topology
+`cpuid` leaves report the i7-9750H's 6 cores / 12 threads, 64-byte cache lines,
+32 KiB / 256 KiB / 12 MiB caches, Coffee Lake CPU family and absence of
+AVX-512, whatever the host CPU. `gethostuuid()` reads `IOPlatformUUID` from
+`darling-platform.plist` when provisioned (falling back to the host machine ID
+otherwise) so it matches `IOPlatformExpertDevice`. `profile=host` reports the
+real host CPU,
 GPU, VRAM and memory. `RCLOL_PLATFORM_PROFILE=host|compat` overrides
 the file for one launch; `RCLOL_SYSTEM_PROP=/path/to/system.prop` selects a different
 file for diagnostics.

@@ -1932,10 +1932,10 @@ index 0000000..9901d10
 +#endif // _RCLOL_CPUID_TRACE_H
 diff --git a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/cpuid_trace.c b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/cpuid_trace.c
 new file mode 100644
-index 0000000..21906b7
+index 0000000..f0249ed
 --- /dev/null
 +++ b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/cpuid_trace.c
-@@ -0,0 +1,963 @@
+@@ -0,0 +1,987 @@
 +// darling-lol: cpuid execute-breakpoint tracer. See cpuid_trace.h for the why.
 +//
 +// Mechanism
@@ -2195,9 +2195,10 @@ index 0000000..21906b7
 +// with hw.cacheconfig, hw.cachesize and leaf 1 whatever the host's core count.
 +// A leaf above the identity's maximum basic or extended leaf returns the
 +// highest basic leaf, as Intel parts do, instead of the host's own AMD leaves
-+// (0x8000001d/0x8000001e topology and the like). The hypervisor range
-+// (0x40000000..0x4fffffff) and the feature leaves (7, 0xd) pass through, so
-+// capability detection still sees what this CPU really supports.
++// (0x8000001d/0x8000001e topology and the like). Leaf 7 keeps host <= AVX2
++// feature bits while clearing AVX-512 bits (absent from i7-9750H) and higher
++// subleaves, so Zen 4/5 hosts do not advertise AVX-512 alongside Coffee Lake.
++// The hypervisor range (0x40000000..0x4fffffff) and leaf 0xd pass through.
 +//
 +// The identity itself lives in one table shared with the sysctls
 +// (common/cpu_identity.h, src/common/cpu_identity.c). The brand string there is
@@ -2356,6 +2357,29 @@ index 0000000..21906b7
 +		break;
 +	case 0x00000004u:
 +		rclol_cache_leaf(id, subleaf, eax, ebx, ecx, edx);
++		break;
++	case 0x00000007u:
++		/* Coffee Lake-H has leaf 7 max subleaf 0 and no AVX-512 extensions.
++		 * Preserve host <= AVX2 capability bits while clearing AVX-512 flags
++		 * that Zen 4/5 hosts expose so leaf 7 agrees with hw.optional.avx512*. */
++		if (subleaf == 0u) {
++			const uint32_t avx512_ebx = (1u << 16) /* F */ | (1u << 17) /* DQ */
++				| (1u << 21) /* IFMA */ | (1u << 26) /* PF */ | (1u << 27) /* ER */
++				| (1u << 28) /* CD */ | (1u << 30) /* BW */ | (1u << 31) /* VL */;
++			const uint32_t avx512_ecx = (1u << 1) /* VBMI */ | (1u << 6) /* VBMI2 */
++				| (1u << 11) /* VNNI */ | (1u << 12) /* BITALG */ | (1u << 14) /* VPOPCNTDQ */;
++			const uint32_t avx512_edx = (1u << 2) /* 4VNNIW */ | (1u << 3) /* 4FMAPS */
++				| (1u << 8) /* VP2INTERSECT */ | (1u << 23) /* FP16 */;
++			*eax = 0u;
++			*ebx &= ~avx512_ebx;
++			*ecx &= ~avx512_ecx;
++			*edx &= ~avx512_edx;
++		} else {
++			*eax = 0u;
++			*ebx = 0u;
++			*ecx = 0u;
++			*edx = 0u;
++		}
 +		break;
 +	case 0x0000000bu: {
 +		/* Extended topology: SMT level, then core level, then invalid levels.
@@ -3001,7 +3025,7 @@ index 7d5ef80..c8672bb 100644
  	[521] = sys_abort_with_payload,
  	[524] = sys_setattrlistat,
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
-index f273989..7ecb675 100644
+index f273989..85ff9c4 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
 @@ -9,13 +9,19 @@
@@ -3025,15 +3049,30 @@ index f273989..7ecb675 100644
  	_HW_PHYSICAL_CPU = 1000,
  	_HW_PHYSICAL_CPU_MAX,
  	_HW_LOGICAL_CPU,
-@@ -24,10 +30,14 @@ enum {
+@@ -24,10 +30,29 @@ enum {
  	_HW_CPUSUBTYPE,
  	_HW_CPUTHREADTYPE,
  	_HW_64BITCAPABLE,
 -	_HW_CPUFREQUENCY = 15,
 +	_HW_CPUFREQUENCY_COMPAT = 15,
++	_HW_CACHELINE_COMPAT = 16,
++	_HW_L1ICACHESIZE_COMPAT = 17,
++	_HW_L1DCACHESIZE_COMPAT = 18,
++	_HW_L2CACHESIZE_COMPAT = 20,
++	_HW_L3CACHESIZE_COMPAT = 22,
++	_HW_TBFREQUENCY_COMPAT = 23,
 +	_HW_CPUFREQUENCY = 1500,
++	_HW_CACHELINESIZE,
++	_HW_L1ICACHESIZE,
++	_HW_L1DCACHESIZE,
++	_HW_L2CACHESIZE,
++	_HW_L3CACHESIZE,
++	_HW_TBFREQUENCY,
 +	_HW_CACHECONFIG = 1200,
 +	_HW_CACHESIZE,
++	_HW_CPUFAMILY,
++	_HW_CPUSUBFAMILY,
++	_HW_PACKAGES,
  };
  
  static sysctl_handler(handle_availcpu);
@@ -3041,33 +3080,63 @@ index f273989..7ecb675 100644
  static sysctl_handler(handle_physicalcpu);
  static sysctl_handler(handle_physicalcpu_max);
  static sysctl_handler(handle_logicalcpu);
-@@ -39,11 +49,78 @@ static sysctl_handler(handle_cpusubtype);
+@@ -37,13 +62,120 @@ static sysctl_handler(handle_pagesize);
+ static sysctl_handler(handle_cputype);
+ static sysctl_handler(handle_cpusubtype);
  static sysctl_handler(handle_cputhreadtype);
++static sysctl_handler(handle_cpufamily);
++static sysctl_handler(handle_cpusubfamily);
++static sysctl_handler(handle_packages);
  static sysctl_handler(handle_cpu64bitcapable);
  static sysctl_handler(handle_machine);
 +static sysctl_handler(handle_model);
  static sysctl_handler(handle_cpufrequency);
 +static sysctl_handler(handle_cpufrequency_compat);
++static sysctl_handler(handle_tbfrequency);
++static sysctl_handler(handle_tbfrequency_compat);
++static sysctl_handler(handle_cachelinesize);
++static sysctl_handler(handle_cachelinesize_compat);
++static sysctl_handler(handle_l1icachesize);
++static sysctl_handler(handle_l1icachesize_compat);
++static sysctl_handler(handle_l1dcachesize);
++static sysctl_handler(handle_l1dcachesize_compat);
++static sysctl_handler(handle_l2cachesize);
++static sysctl_handler(handle_l2cachesize_compat);
++static sysctl_handler(handle_l3cachesize);
++static sysctl_handler(handle_l3cachesize_compat);
 +static sysctl_handler(handle_cacheconfig);
 +static sysctl_handler(handle_cachesize);
 +
-+/* hw.optional: CPUID leaf, output register (0-3 = eax-edx) and bit */
-+static long optional_feature(void* old, unsigned long* oldlen, unsigned int leaf, int reg, int bit)
++/* hw.optional: CPUID leaf, output register (0-3 = eax-edx) and bit.
++ * Features absent from the compatibility SKU (such as AVX-512 on i7-9750H)
++ * must stay 0 under profile=compat even on hosts that support them (Zen 4/5). */
++static long optional_feature(void* old, unsigned long* oldlen, unsigned int leaf, int reg, int bit, int compat_allowed)
 +{
 +	int value = 0;
 +
 +	sysctl_handle_size(sizeof(int));
++	if (darling_compat_profile_enabled() && !compat_allowed)
++	{
++		*((int*) old) = 0;
++		return 0;
++	}
 +#if defined(__i386__) || defined(__x86_64__)
-+	unsigned int regs[4];
-+	__asm__("cpuid" : "=a" (regs[0]), "=b" (regs[1]), "=c" (regs[2]), "=d" (regs[3]) : "0" (leaf), "2" (0));
-+	value = (regs[reg] >> bit) & 1;
++	unsigned int regs[4] = { 0, 0, 0, 0 };
++	__asm__("cpuid" : "=a" (regs[0]), "=b" (regs[1]), "=c" (regs[2]), "=d" (regs[3]) : "0" (0), "2" (0));
++	if (regs[0] >= leaf)
++	{
++		__asm__("cpuid" : "=a" (regs[0]), "=b" (regs[1]), "=c" (regs[2]), "=d" (regs[3]) : "0" (leaf), "2" (0));
++		value = (regs[reg] >> bit) & 1;
++	}
 +#endif
 +	*((int*) old) = value;
 +	return 0;
 +}
 +
 +#define optional_handler(_name, _leaf, _reg, _bit) \
-+	static sysctl_handler(handle_optional_##_name) { return optional_feature(old, oldlen, _leaf, _reg, _bit); }
++	static sysctl_handler(handle_optional_##_name) { return optional_feature(old, oldlen, _leaf, _reg, _bit, 1); }
++#define optional_compat_handler(_name, _leaf, _reg, _bit, _compat_allowed) \
++	static sysctl_handler(handle_optional_##_name) { return optional_feature(old, oldlen, _leaf, _reg, _bit, _compat_allowed); }
 +
 +optional_handler(floatingpoint, 1, 3, 0)
 +optional_handler(mmx, 1, 3, 23)
@@ -3085,7 +3154,13 @@ index f273989..7ecb675 100644
 +optional_handler(avx2_0, 7, 1, 5)
 +optional_handler(bmi1, 7, 1, 3)
 +optional_handler(bmi2, 7, 1, 8)
-+optional_handler(avx512f, 7, 1, 16)
++optional_compat_handler(avx512f, 7, 1, 16, 0)
++optional_compat_handler(avx512cd, 7, 1, 28, 0)
++optional_compat_handler(avx512dq, 7, 1, 17, 0)
++optional_compat_handler(avx512bw, 7, 1, 30, 0)
++optional_compat_handler(avx512vl, 7, 1, 31, 0)
++optional_compat_handler(avx512ifma, 7, 1, 21, 0)
++optional_compat_handler(avx512vbmi, 7, 2, 1, 0)
 +
 +enum {
 +	_HW_OPTIONAL = 1100,
@@ -3110,6 +3185,12 @@ index f273989..7ecb675 100644
 +	{ .oid = 16, .type = CTLTYPE_INT, .exttype = "I", .name = "bmi2", .handler = handle_optional_bmi2 },
 +	{ .oid = 17, .type = CTLTYPE_INT, .exttype = "I", .name = "avx512f", .handler = handle_optional_avx512f },
 +	{ .oid = 18, .type = CTLTYPE_INT, .exttype = "I", .name = "x86_64", .handler = handle_cpu64bitcapable },
++	{ .oid = 19, .type = CTLTYPE_INT, .exttype = "I", .name = "avx512cd", .handler = handle_optional_avx512cd },
++	{ .oid = 20, .type = CTLTYPE_INT, .exttype = "I", .name = "avx512dq", .handler = handle_optional_avx512dq },
++	{ .oid = 21, .type = CTLTYPE_INT, .exttype = "I", .name = "avx512bw", .handler = handle_optional_avx512bw },
++	{ .oid = 22, .type = CTLTYPE_INT, .exttype = "I", .name = "avx512vl", .handler = handle_optional_avx512vl },
++	{ .oid = 23, .type = CTLTYPE_INT, .exttype = "I", .name = "avx512ifma", .handler = handle_optional_avx512ifma },
++	{ .oid = 24, .type = CTLTYPE_INT, .exttype = "I", .name = "avx512vbmi", .handler = handle_optional_avx512vbmi },
 +	{ .oid = -1 }
 +};
  
@@ -3121,8 +3202,13 @@ index f273989..7ecb675 100644
  	{ .oid = _HW_PHYSICAL_CPU, .type = CTLTYPE_INT, .exttype = "", .name = "physicalcpu", .handler = handle_physicalcpu },
  	{ .oid = _HW_PHYSICAL_CPU_MAX, .type = CTLTYPE_INT, .exttype = "", .name = "physicalcpu_max", .handler = handle_physicalcpu_max },
  	{ .oid = _HW_LOGICAL_CPU, .type = CTLTYPE_INT, .exttype = "", .name = "logicalcpu", .handler = handle_logicalcpu },
-@@ -55,27 +132,98 @@ const struct known_sysctl sysctls_hw[] = {
+@@ -53,29 +185,115 @@ const struct known_sysctl sysctls_hw[] = {
+ 	{ .oid = _HW_CPUTYPE, .type = CTLTYPE_INT, .exttype = "", .name = "cputype", .handler = handle_cputype },
+ 	{ .oid = _HW_CPUSUBTYPE, .type = CTLTYPE_INT, .exttype = "", .name = "cpusubtype", .handler = handle_cpusubtype },
  	{ .oid = _HW_CPUTHREADTYPE, .type = CTLTYPE_INT, .exttype = "", .name = "cputhreadtype", .handler = handle_cputhreadtype },
++	{ .oid = _HW_CPUFAMILY, .type = CTLTYPE_INT, .exttype = "I", .name = "cpufamily", .handler = handle_cpufamily },
++	{ .oid = _HW_CPUSUBFAMILY, .type = CTLTYPE_INT, .exttype = "I", .name = "cpusubfamily", .handler = handle_cpusubfamily },
++	{ .oid = _HW_PACKAGES, .type = CTLTYPE_INT, .exttype = "I", .name = "packages", .handler = handle_packages },
  	{ .oid = _HW_64BITCAPABLE, .type = CTLTYPE_INT, .exttype = "", .name = "cpu64bit_capable", .handler = handle_cpu64bitcapable },
  	{ .oid = HW_MACHINE, .type = CTLTYPE_STRING, .exttype = "S", .name = "machine", .handler = handle_machine },
 -	{ .oid = _HW_CPUFREQUENCY, .type = CTLTYPE_INT, .exttype = "", .name = "cpufrequency", .handler = handle_cpufrequency },
@@ -3130,6 +3216,18 @@ index f273989..7ecb675 100644
 +	{ .oid = HW_MODEL, .type = CTLTYPE_STRING, .exttype = "S", .name = "model", .handler = handle_model },
 +	{ .oid = _HW_CPUFREQUENCY, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "cpufrequency", .handler = handle_cpufrequency },
 +	{ .oid = _HW_CPUFREQUENCY_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "cpufrequency_compat", .handler = handle_cpufrequency_compat },
++	{ .oid = _HW_TBFREQUENCY, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "tbfrequency", .handler = handle_tbfrequency },
++	{ .oid = _HW_TBFREQUENCY_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "tbfrequency_compat", .handler = handle_tbfrequency_compat },
++	{ .oid = _HW_CACHELINESIZE, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "cachelinesize", .handler = handle_cachelinesize },
++	{ .oid = _HW_CACHELINE_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "cachelinesize_compat", .handler = handle_cachelinesize_compat },
++	{ .oid = _HW_L1ICACHESIZE, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "l1icachesize", .handler = handle_l1icachesize },
++	{ .oid = _HW_L1ICACHESIZE_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "l1icachesize_compat", .handler = handle_l1icachesize_compat },
++	{ .oid = _HW_L1DCACHESIZE, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "l1dcachesize", .handler = handle_l1dcachesize },
++	{ .oid = _HW_L1DCACHESIZE_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "l1dcachesize_compat", .handler = handle_l1dcachesize_compat },
++	{ .oid = _HW_L2CACHESIZE, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "l2cachesize", .handler = handle_l2cachesize },
++	{ .oid = _HW_L2CACHESIZE_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "l2cachesize_compat", .handler = handle_l2cachesize_compat },
++	{ .oid = _HW_L3CACHESIZE, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "l3cachesize", .handler = handle_l3cachesize },
++	{ .oid = _HW_L3CACHESIZE_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "l3cachesize_compat", .handler = handle_l3cachesize_compat },
 +	{ .oid = _HW_CACHECONFIG, .type = CTLTYPE_OPAQUE, .exttype = "Q", .name = "cacheconfig", .handler = handle_cacheconfig },
 +	{ .oid = _HW_CACHESIZE, .type = CTLTYPE_OPAQUE, .exttype = "Q", .name = "cachesize", .handler = handle_cachesize },
  	{ .oid = -1 }
@@ -3223,7 +3321,7 @@ index f273989..7ecb675 100644
  sysctl_handler(handle_availcpu)
  {
  	sysctl_handle_size(sizeof(int));
-@@ -83,6 +231,13 @@ sysctl_handler(handle_availcpu)
+@@ -83,6 +301,13 @@ sysctl_handler(handle_availcpu)
  	return 0;
  }
  
@@ -3237,7 +3335,7 @@ index f273989..7ecb675 100644
  sysctl_handler(handle_physicalcpu)
  {
  	sysctl_handle_size(sizeof(int));
-@@ -111,6 +266,17 @@ sysctl_handler(handle_logicalcpu_max)
+@@ -111,6 +336,17 @@ sysctl_handler(handle_logicalcpu_max)
  	return 0;
  }
  
@@ -3255,7 +3353,7 @@ index f273989..7ecb675 100644
  sysctl_handler(handle_memsize)
  {
  
-@@ -169,16 +335,57 @@ sysctl_handler(handle_cputhreadtype)
+@@ -169,16 +405,57 @@ sysctl_handler(handle_cputhreadtype)
  	return 0;
  }
  
@@ -3320,7 +3418,7 @@ index f273989..7ecb675 100644
  }
  
  sysctl_handler(handle_cpu64bitcapable)
-@@ -193,3 +400,130 @@ sysctl_handler(handle_machine)
+@@ -193,3 +470,294 @@ sysctl_handler(handle_machine)
  	copyout_string(need_uname()->machine, (char*) old, oldlen);
  	return 0;
  }
@@ -3348,9 +3446,9 @@ index f273989..7ecb675 100644
 +
 +// Number of CPUs in a sysfs list such as "0-1,4-5" (darling_cpu_count_list, shared with the topology probe)
 +
-+// Describes the data/unified cache of one level (1 = L1D) of the host's CPU 0.
-+// Instruction caches are skipped, as in XNU. Returns false if the host doesn't report the level.
-+static bool host_cache_level(unsigned int level, unsigned long long* size, unsigned int* sharing)
++// Describes the instruction or data/unified cache of one level of the host's
++// CPU 0. Returns false if the host does not report the level.
++static bool host_cache_entry(unsigned int level, bool instruction, unsigned long long* size, unsigned int* sharing)
 +{
 +	char path[96], buf[64];
 +
@@ -3366,7 +3464,9 @@ index f273989..7ecb675 100644
 +			continue;
 +
 +		__simple_sprintf(path, HOST_CACHE_DIR "index%d/type", index);
-+		if (!read_string(path, buf, sizeof(buf)) || buf[0] == 'I')
++		if (!read_string(path, buf, sizeof(buf)))
++			continue;
++		if (instruction ? (buf[0] != 'I') : (buf[0] == 'I'))
 +			continue;
 +
 +		__simple_sprintf(path, HOST_CACHE_DIR "index%d/size", index);
@@ -3386,6 +3486,11 @@ index f273989..7ecb675 100644
 +		return true;
 +	}
 +	return false;
++}
++
++static bool host_cache_level(unsigned int level, unsigned long long* size, unsigned int* sharing)
++{
++	return host_cache_entry(level, false, size, sharing);
 +}
 +
 +// The compat profile reports the compatibility part's caches, not the host's:
@@ -3450,6 +3555,163 @@ index f273989..7ecb675 100644
 +			sizes[level] = size;
 +	}
 +	return 0;
++}
++
++static long copyout_quad_or_compat(unsigned long long value, void* old, unsigned long* oldlen, int is_compat)
++{
++	if (is_compat)
++	{
++		sysctl_handle_size(sizeof(unsigned int));
++		*((unsigned int*) old) = (unsigned int) value;
++	}
++	else
++	{
++		sysctl_handle_size(sizeof(unsigned long long));
++		*((unsigned long long*) old) = value;
++	}
++	return 0;
++}
++
++static unsigned long long cacheline_bytes(void)
++{
++	if (darling_compat_profile_enabled())
++		return darling_compat_cpu_identity()->cache_line;
++
++	char buf[32];
++	if (read_string(HOST_CACHE_DIR "index0/coherency_line_size", buf, sizeof(buf)))
++	{
++		unsigned long long bytes = parse_ull(buf, NULL);
++		if (bytes > 0)
++			return bytes;
++	}
++#if defined(__i386__) || defined(__x86_64__)
++	unsigned int a = 0, b = 0, c = 0, d = 0;
++	__asm__("cpuid" : "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "0" (0), "2" (0));
++	if (a >= 1)
++	{
++		__asm__("cpuid" : "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "0" (1), "2" (0));
++		unsigned long long clflush = (unsigned long long) ((b >> 8) & 0xffu) * 8ULL;
++		if (clflush > 0)
++			return clflush;
++	}
++#endif
++	return 64ULL;
++}
++
++static long handle_cache_level_size(unsigned int level, bool instruction, void* old, unsigned long* oldlen, int is_compat)
++{
++	unsigned long long size = 0;
++	unsigned int sharing = 0;
++
++	if (instruction)
++	{
++		if (darling_compat_profile_enabled())
++			size = (unsigned long long) darling_compat_cpu_identity()->l1i_kb << 10;
++		else if (!host_cache_entry(1, true, &size, &sharing))
++			size = 32768ULL;
++	}
++	else if (!cache_level(level, &size, &sharing))
++	{
++		return -ENOENT;
++	}
++	return copyout_quad_or_compat(size, old, oldlen, is_compat);
++}
++
++sysctl_handler(handle_cpufamily)
++{
++	sysctl_handle_size(sizeof(int));
++	if (darling_compat_profile_enabled())
++	{
++		*((int*) old) = (int) darling_compat_cpu_identity()->cpufamily;
++		return 0;
++	}
++	unsigned int family = 0;
++#if defined(__i386__) || defined(__x86_64__)
++	unsigned int a = 0, b = 0, c = 0, d = 0;
++	__asm__("cpuid" : "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "0" (0), "2" (0));
++	if (a >= 1)
++	{
++		int is_intel = (b == 0x756e6547u && d == 0x49656e69u && c == 0x6c65746eu);
++		__asm__("cpuid" : "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "0" (1), "2" (0));
++		family = darling_intel_cpufamily(is_intel, a);
++	}
++#endif
++	*((int*) old) = (int) family;
++	return 0;
++}
++
++sysctl_handler(handle_cpusubfamily)
++{
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 0; // CPUSUBFAMILY_UNKNOWN on x86_64 (XNU kern_mib.c)
++	return 0;
++}
++
++sysctl_handler(handle_packages)
++{
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 1;
++	return 0;
++}
++
++sysctl_handler(handle_tbfrequency)
++{
++	return copyout_quad_or_compat(1000000000ULL, old, oldlen, 0);
++}
++
++sysctl_handler(handle_tbfrequency_compat)
++{
++	return copyout_quad_or_compat(1000000000ULL, old, oldlen, 1);
++}
++
++sysctl_handler(handle_cachelinesize)
++{
++	return copyout_quad_or_compat(cacheline_bytes(), old, oldlen, 0);
++}
++
++sysctl_handler(handle_cachelinesize_compat)
++{
++	return copyout_quad_or_compat(cacheline_bytes(), old, oldlen, 1);
++}
++
++sysctl_handler(handle_l1icachesize)
++{
++	return handle_cache_level_size(1, true, old, oldlen, 0);
++}
++
++sysctl_handler(handle_l1icachesize_compat)
++{
++	return handle_cache_level_size(1, true, old, oldlen, 1);
++}
++
++sysctl_handler(handle_l1dcachesize)
++{
++	return handle_cache_level_size(1, false, old, oldlen, 0);
++}
++
++sysctl_handler(handle_l1dcachesize_compat)
++{
++	return handle_cache_level_size(1, false, old, oldlen, 1);
++}
++
++sysctl_handler(handle_l2cachesize)
++{
++	return handle_cache_level_size(2, false, old, oldlen, 0);
++}
++
++sysctl_handler(handle_l2cachesize_compat)
++{
++	return handle_cache_level_size(2, false, old, oldlen, 1);
++}
++
++sysctl_handler(handle_l3cachesize)
++{
++	return handle_cache_level_size(3, false, old, oldlen, 0);
++}
++
++sysctl_handler(handle_l3cachesize_compat)
++{
++	return handle_cache_level_size(3, false, old, oldlen, 1);
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
 index bd9cdc2..61fe056 100644
@@ -3530,14 +3792,13 @@ index bd9cdc2..61fe056 100644
 +	return 0;
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
-index 4319355..da10132 100644
+index 4319355..38f8cc3 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
-@@ -2,8 +2,12 @@
+@@ -2,8 +2,11 @@
  
  #include <sys/errno.h>
  #include <alloca.h>
-+extern char *getenv(const char *name);
 +extern char *strstr(const char *s, const char *find), *strchr(const char *s, int c);
  
  #include <darling/emulation/common/simple.h>
@@ -3546,7 +3807,7 @@ index 4319355..da10132 100644
  #include <darling/emulation/conversion/fcntl/open.h>
  #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
  #include <darling/emulation/xnu_syscall/bsd/helper/misc/readline.h>
-@@ -25,6 +29,7 @@ enum {
+@@ -25,6 +28,7 @@ enum {
  	_CPU_BRAND_STRING,
  	_CPU_FEATURES,
  	_CPU_CORE_COUNT,
@@ -3554,7 +3815,7 @@ index 4319355..da10132 100644
  };
  
  static sysctl_handler(handle_vendor);
-@@ -32,9 +37,39 @@ static sysctl_handler(handle_max_basic);
+@@ -32,9 +36,42 @@ static sysctl_handler(handle_max_basic);
  static sysctl_handler(handle_family);
  static sysctl_handler(handle_model);
  static sysctl_handler(handle_stepping);
@@ -3562,8 +3823,11 @@ index 4319355..da10132 100644
 -static sysctl_handler(handle_features);
 +static sysctl_handler(handle_brand_string)
 +{
-+	const char* brand = getenv("RCLOL_CPU_BRAND");
++	const char* brand = darling_configured_cpu_brand();
 +	char cpuinfo[4096];
++
++	if (brand == NULL && darling_compat_profile_enabled())
++		brand = darling_compat_cpu_identity()->brand;
 +
 +	if (brand == NULL || brand[0] == '\0')
 +	{
@@ -3596,7 +3860,7 @@ index 4319355..da10132 100644
  
  const struct known_sysctl sysctls_machdep_cpu[] = {
      { .oid = _CPU_MAX_BASIC, .type = CTLTYPE_INT, .exttype = "I", .name = "max_basic", .handler = handle_max_basic },
-@@ -42,9 +77,10 @@ const struct known_sysctl sysctls_machdep_cpu[] = {
+@@ -42,9 +79,10 @@ const struct known_sysctl sysctls_machdep_cpu[] = {
      { .oid = _CPU_FAMILY, .type = CTLTYPE_INT, .exttype = "I", .name = "family", .handler = handle_family },
  		{ .oid = _CPU_MODEL, .type = CTLTYPE_INT, .exttype = "I", .name = "model", .handler = handle_model },
  		{ .oid = _CPU_STEPPING, .type = CTLTYPE_INT, .exttype = "I", .name = "stepping", .handler = handle_stepping },
@@ -3608,7 +3872,7 @@ index 4319355..da10132 100644
  	{ .oid = -1 }
  };
  
-@@ -70,31 +106,100 @@ const struct known_sysctl sysctls_machdep[] = {
+@@ -70,31 +108,100 @@ const struct known_sysctl sysctls_machdep[] = {
  #endif
  
  
@@ -3617,10 +3881,7 @@ index 4319355..da10132 100644
 +// as the leaf, so every caller ran leaf 0 regardless of the value it asked for.
 +static void cpuid_leaf(unsigned int leaf, unsigned int* eax, unsigned int* ebx,
 +		unsigned int* ecx, unsigned int* edx)
- {
--        char tmp[64];
--        __simple_sprintf(tmp, "%d", value);
--        copyout_string(tmp, to_copy, to_copy_length);
++{
 +	unsigned int a, b, c, d;
 +
 +	__cpuid(leaf, a, b, c, d);
@@ -3628,14 +3889,17 @@ index 4319355..da10132 100644
 +	*ebx = b;
 +	*ecx = c;
 +	*edx = d;
- }
- 
++}
++
 +// machdep.cpu.family/model/stepping/max_basic are CTLTYPE_INT on macOS: a
 +// four-byte integer. They used to be written with copyout_string(), so a
 +// caller asking for an int received the first one or two digits ("158") as the
 +// value; the string branch of copyout_string also reported a 1-2 byte size.
 +static int copyout_int32(unsigned int value, void* out, unsigned long* out_len)
-+{
+ {
+-        char tmp[64];
+-        __simple_sprintf(tmp, "%d", value);
+-        copyout_string(tmp, to_copy, to_copy_length);
 +	if (out == NULL)
 +	{
 +		if (out_len != NULL)
@@ -3651,8 +3915,8 @@ index 4319355..da10132 100644
 +	if (out_len != NULL)
 +		*out_len = sizeof(value);
 +	return 0;
-+}
-+
+ }
+ 
 +// ---------------------------------------------------------------------------
 +// The CPU identity node.
 +//
@@ -3719,20 +3983,20 @@ index 4319355..da10132 100644
  	v.name[12] = 0;
  	copyout_string(v.name, (char*) old, oldlen);
  
-@@ -103,211 +208,181 @@ sysctl_handler(handle_vendor)
+@@ -103,211 +210,184 @@ sysctl_handler(handle_vendor)
  
  sysctl_handler(handle_max_basic)
  {
 -	setup(0);
--
--
--    __cpuid(level, eax, ebx, ecx, edx);
 +	unsigned int eax, ebx, ecx, edx;
  
--	copyout_int(eax, (char*)old,oldlen);
 +	if (darling_compat_profile_enabled())
 +		return copyout_int32(darling_compat_cpu_identity()->max_basic, old, oldlen);
  
+-    __cpuid(level, eax, ebx, ecx, edx);
+-
+-	copyout_int(eax, (char*)old,oldlen);
+-
 -	return 0;
 +	cpuid_leaf(0, &eax, &ebx, &ecx, &edx);
 +	return copyout_int32(eax, old, oldlen);
@@ -3741,14 +4005,14 @@ index 4319355..da10132 100644
  sysctl_handler(handle_family)
  {
 -    setup(1);
--
++	unsigned int eax, ebx, ecx, edx;
++	unsigned int signature;
+ 
 -    __cpuid(level, eax, ebx, ecx, edx);
 -
 -    eax = eax >> 7;
 -    eax &= 15;
-+	unsigned int eax, ebx, ecx, edx;
-+	unsigned int signature;
- 
+-
 -    copyout_int(eax, old, oldlen);
 +	if (darling_compat_profile_enabled())
 +		signature = darling_compat_cpu_identity()->signature;
@@ -3767,12 +4031,12 @@ index 4319355..da10132 100644
 -    setup(1);
 -
 -    __cpuid(level, eax, ebx, ecx, edx);
+-
+-    eax = eax >> 3;
+-    eax &= 15;
 +	unsigned int eax, ebx, ecx, edx;
 +	unsigned int signature;
  
--    eax = eax >> 3;
--    eax &= 15;
--
 -    copyout_int(eax,(char*)old, oldlen);
 +	if (darling_compat_profile_enabled())
 +		signature = darling_compat_cpu_identity()->signature;
@@ -3789,11 +4053,11 @@ index 4319355..da10132 100644
  sysctl_handler(handle_stepping)
  {
 -    setup(1);
+-
+-    __cpuid(level, eax, ebx, ecx, edx);
 +	unsigned int eax, ebx, ecx, edx;
 +	unsigned int signature;
  
--    __cpuid(level, eax, ebx, ecx, edx);
--
 -    eax &= 15;
 -
 -    copyout_int(eax,(char*)old, oldlen);
@@ -3987,41 +4251,47 @@ index 4319355..da10132 100644
 -	int infofd = sys_open_nocancel("/proc/cpuinfo", BSD_O_RDONLY, 0);
 -	struct rdline_buffer rbuf;
 -	const char* line;
++	if (core_count == 0 && !topo->fixed && darling_compat_profile_enabled())
++		core_count = darling_compat_cpu_identity()->cores;
+ 
+-	// a reasonable default
+-	size_t core_count = 1;
 +	if (core_count == 0) {
 +		// it's easier to use /proc/cpuinfo for this.
 +		// using cpuid directly is more difficult because AMD processors don't use the same method as Intel processors.
  
--	// a reasonable default
--	size_t core_count = 1;
+-	if (infofd < 0)
+-		goto out;
 +		infofd = sys_open_nocancel("/proc/cpuinfo", BSD_O_RDONLY, 0);
 +		struct rdline_buffer rbuf;
 +		const char* line;
  
--	if (infofd < 0)
--		goto out;
+-	_readline_init(&rbuf);
 +		// a reasonable default
 +		core_count = 1;
- 
--	_readline_init(&rbuf);
-+		if (infofd < 0)
-+			goto out;
  
 -	while ((line = _readline(infofd, &rbuf)) != NULL) {
 -		if (strncmp(line, "cpu cores", 9) != 0) {
 -			continue;
 -		}
-+		_readline_init(&rbuf);
++		if (infofd < 0)
++			goto out;
  
 -		// great, we've got "cpu cores"
 -		// now find the actual number
 -		while (*line != ':' && *line != '\0')
 -			++line;
++		_readline_init(&rbuf);
+ 
+-		// shouldn't happen, but just in case
+-		if (*line == '\0')
+-			continue;
 +		while ((line = _readline(infofd, &rbuf)) != NULL) {
 +			if (strncmp(line, "cpu cores", 9) != 0) {
 +				continue;
 +			}
  
--		// shouldn't happen, but just in case
+-		++line; // skip the colon
 -		if (*line == '\0')
 -			continue;
 +			// great, we've got "cpu cores"
@@ -4029,33 +4299,30 @@ index 4319355..da10132 100644
 +			while (*line != ':' && *line != '\0')
 +				++line;
  
--		++line; // skip the colon
+-		++line; // skip the space
 -		if (*line == '\0')
 -			continue;
 +			// shouldn't happen, but just in case
 +			if (*line == '\0')
 +				continue;
- 
--		++line; // skip the space
--		if (*line == '\0')
--			continue;
-+			++line; // skip the colon
-+			if (*line == '\0')
-+				continue;
 +
-+			++line; // skip the space
++			++line; // skip the colon
 +			if (*line == '\0')
 +				continue;
  
 -		core_count = __simple_atoi(line, NULL);
 -		break;
++			++line; // skip the space
++			if (*line == '\0')
++				continue;
++
 +			core_count = __simple_atoi(line, NULL);
 +			break;
 +		}
  	}
  
  out:
-@@ -319,3 +394,21 @@ out:
+@@ -319,3 +399,24 @@ out:
  		*oldlen = sizeof(uint32_t);
  	return 0;
  }
@@ -4064,6 +4331,9 @@ index 4319355..da10132 100644
 +sysctl_handler(handle_thread_count) {
 +	const struct darling_cpu_topology* topo = darling_host_cpu_topology();
 +	size_t thread_count = (topo->detected && !topo->fixed) ? topo->online : 0;
++
++	if (thread_count == 0 && !topo->fixed && darling_compat_profile_enabled())
++		thread_count = darling_compat_cpu_identity()->threads;
 +
 +	if (thread_count == 0) {
 +		// Detection failed or the opt-out is active: fall back to the same
@@ -4979,7 +5249,7 @@ index 0000000..dec5552
 +	return -ENOSYS;
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/proc_info.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/proc_info.c
-index c2f70fb..6ba89a3 100644
+index c2f70fb..431e544 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/proc_info.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/proc_info.c
 @@ -83,6 +83,38 @@ long sys_proc_info(uint32_t callnum, int32_t pid, uint32_t flavor,
@@ -5021,7 +5291,36 @@ index c2f70fb..6ba89a3 100644
  		case 1: // proc_listpids
  		default:
  			__simple_printf("sys_proc_info(): Unsupported callnum: %d\n",
-@@ -328,6 +360,8 @@ static long _proc_pidinfo_tbsdinfo(int32_t pid, void* buffer, int32_t bufsize)
+@@ -100,7 +132,8 @@ static bool parse_smaps_firstline(
+ 	uint64_t* pri_offset,
+ 	uint32_t* vst_dev,
+ 	uint64_t* vst_ino,
+-	char* vip_path
++	char* vip_path,
++	unsigned long vip_path_size
+ );
+ static long _proc_pidinfo_regionpathinfo(int32_t pid, uint64_t arg, void* buffer, int32_t bufsize);
+ static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsize);
+@@ -118,10 +151,15 @@ long _proc_pidinfo(int32_t pid, uint32_t flavor, uint64_t arg, void* buffer, int
+ 	switch (flavor)
+ 	{
+ 		// arg is a memory location we want to know about
+-		// We return information on the mapping where the address belongs or any following mapping
+-		// Then we return -ESRCH.
+-		// Usage example: https://github.com/fhunleth/android_external_lsof/blob/master/dialects/darwin/libproc/dproc.c
++		// We return information on the mapping where the address belongs
++		// or return -ESRCH.
+ 		case PROC_PIDREGIONPATHINFO:
++#ifdef PROC_PIDREGIONPATHINFO2
++		case PROC_PIDREGIONPATHINFO2:
++#endif
++#ifdef PROC_PIDREGIONPATHINFO3
++		case PROC_PIDREGIONPATHINFO3:
++#endif
+ 		{
+ 			return _proc_pidinfo_regionpathinfo(pid, arg, buffer, bufsize);
+ 		}
+@@ -328,6 +366,8 @@ static long _proc_pidinfo_tbsdinfo(int32_t pid, void* buffer, int32_t bufsize)
  	info->pbi_start_tvusec = starttime_usecs;
  
  	memcpy(info->pbi_comm, shortinfo.pbsi_comm, sizeof(info->pbi_comm));
@@ -5030,7 +5329,7 @@ index c2f70fb..6ba89a3 100644
  
  	return sizeof(struct proc_bsdinfo);
  reterr:
-@@ -390,7 +424,9 @@ static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsiz
+@@ -390,7 +430,9 @@ static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsiz
  
  	// comm
  	READELEM();
@@ -5041,7 +5340,7 @@ index c2f70fb..6ba89a3 100644
  
  	// process state
  	READELEM();
-@@ -437,7 +473,8 @@ static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsiz
+@@ -437,7 +479,8 @@ static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsiz
  	if (is_64_bit)
  		info->pbsi_flags |= P_LP64;
  
@@ -5050,6 +5349,267 @@ index c2f70fb..6ba89a3 100644
 +	return sizeof(*info);
  reterr:
  	return -EINVAL;
+ }
+@@ -455,18 +498,49 @@ static long _proc_pidinfo_regionpath_setup(int32_t pid, struct rdline_buffer* bu
+ 	return fd;
+ };
+ 
+-static long _proc_pidinfo_regionpathinfo(int32_t pid, uint64_t arg, void* buffer, int32_t bufsize)
++static void proc_unexpand_region_path(struct vchroot_unexpand_args* uargs, char* out_path, unsigned long out_size)
++{
++	if (!out_path || out_size == 0)
++		return;
++	out_path[0] = '\0';
++
++	// Anonymous or pseudo-mappings ([stack], [vdso], [heap]) have no file path on macOS.
++	if (!uargs || uargs->path[0] != '/')
++		return;
++
++	// vchroot_unexpand prepends "/Volumes/SystemRoot" (19 bytes) in place without checking bounds.
++	unsigned long raw_len = strlen(uargs->path);
++	if (raw_len >= sizeof(uargs->path) - 32)
++		return;
++
++	if (vchroot_unexpand(uargs) != 0)
++		return;
++
++	unsigned long unexpanded_len = strlen(uargs->path);
++	if (unexpanded_len >= out_size)
++		unexpanded_len = out_size - 1;
++	memcpy(out_path, uargs->path, unexpanded_len);
++	out_path[unexpanded_len] = '\0';
++}
++
++static long find_region_mapping(
++	int32_t pid,
++	uint64_t arg,
++	struct proc_regioninfo* info_out,
++	uint32_t* vst_dev_out,
++	uint64_t* vst_ino_out,
++	char* path_out,
++	unsigned long path_size
++)
+ {
+ 	struct rdline_buffer buf;
+-	int fd;
++	struct vchroot_unexpand_args uargs;
++	struct proc_regioninfo candidate;
+ 	const char* line;
+-	struct proc_regionwithpathinfo my_rpi;
+-	bool foundRegion = false;
+-
+-	if (!buffer)
+-		return -EFAULT;
+-	if (bufsize < sizeof(my_rpi))
+-		return -ENOSPC;
++	uint32_t vst_dev = 0;
++	uint64_t vst_ino = 0;
++	int fd;
++	bool found = false;
+ 
+ 	fd = _proc_pidinfo_regionpath_setup(pid, &buf);
+ 	if (fd < 0)
+@@ -474,89 +548,100 @@ static long _proc_pidinfo_regionpathinfo(int32_t pid, uint64_t arg, void* buffer
+ 
+ 	while ((line = _readline(fd, &buf)) != NULL)
+ 	{
+-		if (!foundRegion)
++		memset(&candidate, 0, sizeof(candidate));
++		vst_dev = 0;
++		vst_ino = 0;
++
++		if (parse_smaps_firstline(
++			line,
++			&candidate.pri_address,
++			&candidate.pri_size,
++			&candidate.pri_protection,
++			&candidate.pri_share_mode,
++			&candidate.pri_offset,
++			&vst_dev,
++			&vst_ino,
++			uargs.path,
++			sizeof(uargs.path) - 32
++		))
+ 		{
+-			// Searching for matching memory region.
+-			// This call returns true if we see the start of another mapping.
+-			if (parse_smaps_firstline(
+-				line,
+-				&my_rpi.prp_prinfo.pri_address,
+-				&my_rpi.prp_prinfo.pri_size,
+-				&my_rpi.prp_prinfo.pri_protection,
+-				&my_rpi.prp_prinfo.pri_share_mode,
+-				&my_rpi.prp_prinfo.pri_offset,
+-				&my_rpi.prp_vip.vip_vi.vi_stat.vst_dev,
+-				&my_rpi.prp_vip.vip_vi.vi_stat.vst_ino,
+-				my_rpi.prp_vip.vip_path
+-			))
++			if (arg >= candidate.pri_address && arg < (candidate.pri_address + candidate.pri_size))
+ 			{
+-				if (arg >= my_rpi.prp_prinfo.pri_address && arg < (my_rpi.prp_prinfo.pri_address + my_rpi.prp_prinfo.pri_size))
+-				{
+-					foundRegion = true;
+-				}
++				found = true;
++				break;
+ 			}
+ 		}
+-		else
+-		{
+-			// TODO: Parse additional information (e.g. RSS)
+-		}
+ 	}
+ 	close_internal(fd);
+ 
+-	if (my_rpi.prp_vip.vip_path[0])
+-	{
+-		// TODO: Provide information in struct vinfo_stat
+-	}
++	if (!found)
++		return -ESRCH;
++
++	if (info_out)
++		*info_out = candidate;
++	if (vst_dev_out)
++		*vst_dev_out = vst_dev;
++	if (vst_ino_out)
++		*vst_ino_out = vst_ino;
++	proc_unexpand_region_path(&uargs, path_out, path_size);
++	return 0;
++}
++
++static long _proc_pidinfo_regionpathinfo(int32_t pid, uint64_t arg, void* buffer, int32_t bufsize)
++{
++	struct proc_regionwithpathinfo my_rpi;
++	long err;
++
++	if (!buffer)
++		return -EFAULT;
++	if (bufsize < (int32_t)sizeof(my_rpi))
++		return -ENOSPC;
++
++	memset(&my_rpi, 0, sizeof(my_rpi));
++	err = find_region_mapping(
++		pid,
++		arg,
++		&my_rpi.prp_prinfo,
++		&my_rpi.prp_vip.vip_vi.vi_stat.vst_dev,
++		&my_rpi.prp_vip.vip_vi.vi_stat.vst_ino,
++		my_rpi.prp_vip.vip_path,
++		sizeof(my_rpi.prp_vip.vip_path)
++	);
++	if (err < 0)
++		return err;
+ 
+ 	memcpy(buffer, &my_rpi, sizeof(my_rpi));
+-	return foundRegion ? 1 : -ESRCH;
++	return (long)sizeof(my_rpi);
+ }
+ 
+ static long _proc_pidinfo_regionpath(int32_t pid, uint64_t arg, void* buffer, int32_t buffer_size) {
+-	// `_proc_pidinfo_regionpathinfo` is a glutton for stack space, due to the size of `struct proc_regioninfo`
+-	//
+-	// so rather than calling it and extracting the necessary information, it's better to have most of the common code
+-	// moved out and duplicate some minimal amounts of code for this function
+-
+ 	struct proc_regionpath my_rp;
+-	int fd;
+-	struct rdline_buffer readline_buffer;
+-	const char* line;
+-	bool found = false;
++	struct proc_regioninfo region_info;
++	long err;
+ 
+ 	if (!buffer)
+ 		return -EFAULT;
+-	if (buffer_size < sizeof(my_rp))
++	if (buffer_size < (int32_t)sizeof(my_rp))
+ 		return -ENOSPC;
+ 
+-	fd = _proc_pidinfo_regionpath_setup(pid, &readline_buffer);
+-	if (fd < 0)
+-		return fd;
+-
+-	while ((line = _readline(fd, &readline_buffer)) != NULL) {
+-		if (parse_smaps_firstline(
+-			line,
+-			&my_rp.prpo_addr,
+-			&my_rp.prpo_regionlength,
+-			NULL,
+-			NULL,
+-			NULL,
+-			NULL,
+-			NULL,
+-			my_rp.prpo_path
+-		)) {
+-			if (arg >= my_rp.prpo_addr && arg < (my_rp.prpo_addr + my_rp.prpo_regionlength)) {
+-				found = true;
+-				break;
+-			}
+-		}
+-	}
+-
+-	close_internal(fd);
++	memset(&my_rp, 0, sizeof(my_rp));
++	err = find_region_mapping(
++		pid,
++		arg,
++		&region_info,
++		NULL,
++		NULL,
++		my_rp.prpo_path,
++		sizeof(my_rp.prpo_path)
++	);
++	if (err < 0)
++		return err;
+ 
++	my_rp.prpo_addr = region_info.pri_address;
++	my_rp.prpo_regionlength = region_info.pri_size;
+ 	memcpy(buffer, &my_rp, sizeof(my_rp));
+-	return found ? strlen(my_rp.prpo_path) : -EINVAL;
+-};
++	return (long)sizeof(my_rp);
++}
+ 
+ // Parses line such as:
+ // 5568e1914000-5568e1915000 r--p 00024000 08:01 4861625                    /usr/bin/less
+@@ -569,13 +654,17 @@ static bool parse_smaps_firstline(
+ 	uint64_t* pri_offset,
+ 	uint32_t* vst_dev,
+ 	uint64_t* vst_ino,
+-	char* vip_path
++	char* vip_path,
++	unsigned long vip_path_size
+ )
+ {
+ 	const char* p;
+ 	const char* minus = NULL;
+ 	uint64_t backup_variable;
+ 
++	if (vip_path && vip_path_size > 0)
++		vip_path[0] = '\0';
++
+ 	if (!pri_address)
+ 		pri_address = &backup_variable;
+ 
+@@ -643,8 +732,16 @@ static bool parse_smaps_firstline(
+ 	// Read file name (may be empty)
+ 	while (*p == ' ')
+ 		p++;
+-	if (*p && vip_path) // Is file name present? (and the caller wants it)
+-		strcpy(vip_path, p);
++	if (*p && vip_path && vip_path_size > 0) // Is file name present? (and the caller wants it)
++	{
++		unsigned long n = 0;
++		while (p[n] && n < vip_path_size - 1)
++		{
++			vip_path[n] = p[n];
++			n++;
++		}
++		vip_path[n] = '\0';
++	}
+ 
+ 	return true;
  }
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/ptrace.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/ptrace.c
 index 0a8f1e4..9651453 100644
@@ -10097,10 +10657,10 @@ index a26ae39..0fb6d6a 100644
  	.space 13, 0x90
 diff --git a/darling/src/libsystem_kernel/emulation/include/common/cpu_identity.h b/darling/src/libsystem_kernel/emulation/include/common/cpu_identity.h
 new file mode 100644
-index 0000000..94ccc4e
+index 0000000..7066ec6
 --- /dev/null
 +++ b/darling/src/libsystem_kernel/emulation/include/common/cpu_identity.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,63 @@
 +#ifndef DARLING_LOL_CPU_IDENTITY_H
 +#define DARLING_LOL_CPU_IDENTITY_H
 +
@@ -10135,10 +10695,17 @@ index 0000000..94ccc4e
 +	uint32_t l3_kb;       // package L3 (leaf 4, hw.cachesize[3])
 +	uint32_t base_mhz;    // hw.cpufrequency, leaf 0x16 EAX
 +	uint32_t max_mhz;     // leaf 0x16 EBX (maximum turbo)
++	uint32_t l1i_kb;      // per-core L1 instruction cache (hw.l1icachesize)
++	uint32_t cache_line;  // cache line size in bytes (hw.cachelinesize)
++	uint32_t cpufamily;   // XNU CPUFAMILY_* (hw.cpufamily)
 +};
 +
 +// The compatibility identity. Never NULL.
 +const struct darling_cpu_identity* darling_compat_cpu_identity(void);
++
++// Decode XNU hw.cpufamily from a CPUID leaf 1 EAX signature (0 if unknown or
++// not an Intel processor). Matches XNU cpuid_set_cpufamily().
++uint32_t darling_intel_cpufamily(int vendor_is_intel, uint32_t signature);
 +
 +// 1 when the launcher selected the compat profile for this process
 +// (RCLOL_PLATFORM_PROFILE=compat). Reads /proc/self/environ with raw syscalls
@@ -10159,10 +10726,10 @@ index 0000000..94ccc4e
 +#endif // DARLING_LOL_CPU_IDENTITY_H
 diff --git a/darling/src/libsystem_kernel/emulation/src/common/cpu_identity.c b/darling/src/libsystem_kernel/emulation/src/common/cpu_identity.c
 new file mode 100644
-index 0000000..be2c03e
+index 0000000..a5b1440
 --- /dev/null
 +++ b/darling/src/libsystem_kernel/emulation/src/common/cpu_identity.c
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,213 @@
 +// darling-lol: the shared compatibility CPU identity. See common/cpu_identity.h.
 +
 +#include <darling/emulation/common/cpu_identity.h>
@@ -10192,11 +10759,52 @@ index 0000000..be2c03e
 +	.l3_kb = 12288,
 +	.base_mhz = 2600,
 +	.max_mhz = 4500,
++	.l1i_kb = 32,
++	.cache_line = 64,
++	.cpufamily = 0x0f817246u,
 +};
 +
 +const struct darling_cpu_identity* darling_compat_cpu_identity(void)
 +{
 +	return &g_compat_identity;
++}
++
++uint32_t darling_intel_cpufamily(int vendor_is_intel, uint32_t signature)
++{
++	uint32_t base_family = (signature >> 8) & 0xfu;
++	uint32_t ext_family = (signature >> 20) & 0xffu;
++	uint32_t family = (base_family == 0xfu) ? (base_family + ext_family) : base_family;
++	uint32_t base_model = (signature >> 4) & 0xfu;
++	uint32_t ext_model = (signature >> 16) & 0xfu;
++	uint32_t model = (ext_model << 4) | base_model;
++
++	if (!vendor_is_intel || family != 6u)
++		return 0u;
++
++	switch (model)
++	{
++		case 0x17: return 0x78ea4fbcu;
++		case 0x1a: case 0x1e: case 0x1f: case 0x2e:
++			return 0x6b5a4cd2u;
++		case 0x25: case 0x2c: case 0x2f:
++			return 0x573b5eecu;
++		case 0x2a: case 0x2d:
++			return 0x5490b78cu;
++		case 0x3a: case 0x3e:
++			return 0x1f65e835u;
++		case 0x3c: case 0x3f: case 0x45: case 0x46:
++			return 0x10b282dcu;
++		case 0x3d: case 0x47:
++			return 0x582ed09cu;
++		case 0x4e: case 0x55: case 0x5e:
++			return 0x37fc219fu;
++		case 0x8e: case 0x9e:
++			return 0x0f817246u;
++		case 0x7d: case 0x7e: case 0x9f:
++			return 0x38435547u;
++		default:
++			return 0u;
++	}
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -10489,3 +11097,310 @@ index 407996e..4bcdfa8 100644
 +bool darling_process_name(int pid, char* out, unsigned long size);
 +
  #endif // _SYSCTL_PROC_H
+diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/gethostuuid.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/gethostuuid.c
+index 9b6e94b..a70bb5c 100644
+--- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/gethostuuid.c
++++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/gethostuuid.c
+@@ -5,43 +5,29 @@
+ 
+ #include <darling/emulation/common/base.h>
+ #include <darling/emulation/conversion/errno.h>
++#include <darling/emulation/conversion/fcntl/open.h>
+ #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
+ #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
+ #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
+ #include <darling/emulation/xnu_syscall/bsd/impl/unistd/read.h>
+ 
+-static int hex2bin(const char* str, unsigned char* uuid_buf);
++#ifndef RCLOL_PLATFORM_PLIST_PATH
++#define RCLOL_PLATFORM_PLIST_PATH "/private/etc/darling-platform.plist"
++#endif
+ 
+-long sys_gethostuuid(unsigned char* uuid_buf, void* timeout)
+-{
+-	int ret, fd;
+-	char buf[32];
+-
+-	fd = sys_open("/Volumes/SystemRoot/etc/machine-id", O_RDONLY, 0);
+-	if (fd < 0)
+-		return fd;
+-
+-	ret = sys_read(fd, buf, sizeof(buf));
+-	close_internal(fd);
+-
+-	if (ret < 0)
+-		return ret;
+-	if (ret != sizeof(buf))
+-		return -ENOSYS;
++#ifndef RCLOL_MACHINE_ID_PATH
++#define RCLOL_MACHINE_ID_PATH "/Volumes/SystemRoot/etc/machine-id"
++#endif
+ 
+-	return hex2bin(buf, uuid_buf);
+-}
+-
+-static inline unsigned char hvalue(char c)
++static int hex_nibble(char c)
+ {
+ 	if (c >= '0' && c <= '9')
+ 		return c - '0';
+-	else if (c >= 'A' && c <= 'F')
++	if (c >= 'A' && c <= 'F')
+ 		return 10 + (c - 'A');
+-	else if (c >= 'a' && c <= 'f')
++	if (c >= 'a' && c <= 'f')
+ 		return 10 + (c - 'a');
+-	else
+-		return 0;
++	return -1;
+ }
+ 
+ static int hex2bin(const char* str, unsigned char* uuid_buf)
+@@ -50,13 +36,243 @@ static int hex2bin(const char* str, unsigned char* uuid_buf)
+ 
+ 	for (i = 0; i < 16; i++)
+ 	{
+-		unsigned char v;
++		int hi = hex_nibble(str[i * 2]);
++		int lo = hex_nibble(str[i * 2 + 1]);
++
++		if (hi < 0 || lo < 0)
++			return -1;
++		uuid_buf[i] = (unsigned char) ((hi << 4) | lo);
++	}
++
++	return 0;
++}
++
++static int is_space(char c)
++{
++	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++static int span_eq(const char* s, unsigned long len, const char* lit)
++{
++	unsigned long i = 0;
++
++	while (lit[i] != '\0')
++	{
++		if (i >= len || s[i] != lit[i])
++			return 0;
++		i++;
++	}
++	return i == len;
++}
++
++static int parse_uuid_str(const char* s, unsigned long len, unsigned char* uuid_buf)
++{
++	unsigned char out[16];
++	unsigned long si = 0;
++	int out_i = 0;
++	int nonzero = 0;
++
++	if (len != 36)
++		return -1;
++
++	while (si < len)
++	{
++		if (si == 8 || si == 13 || si == 18 || si == 23)
++		{
++			if (s[si] != '-')
++				return -1;
++			si++;
++			continue;
++		}
++		if (si + 1 >= len || out_i >= 16)
++			return -1;
++		int hi = hex_nibble(s[si]);
++		int lo = hex_nibble(s[si + 1]);
++		if (hi < 0 || lo < 0)
++			return -1;
++		out[out_i] = (unsigned char) ((hi << 4) | lo);
++		if (out[out_i] != 0)
++			nonzero = 1;
++		out_i++;
++		si += 2;
++	}
++	if (out_i != 16 || !nonzero)
++		return -1;
++
++	for (int i = 0; i < 16; i++)
++		uuid_buf[i] = out[i];
++	return 0;
++}
++
++static unsigned long find_char(const char* s, unsigned long start, unsigned long len, char ch)
++{
++	unsigned long i = start;
++
++	while (i < len && s[i] != ch)
++		i++;
++	return i;
++}
++
++static unsigned long skip_ws_and_comments(const char* s, unsigned long pos, unsigned long len)
++{
++	while (pos < len)
++	{
++		if (is_space(s[pos]))
++		{
++			pos++;
++			continue;
++		}
++		if (pos + 4 <= len && s[pos] == '<' && s[pos + 1] == '!'
++				&& s[pos + 2] == '-' && s[pos + 3] == '-')
++		{
++			pos += 4;
++			while (pos + 3 <= len && !(s[pos] == '-' && s[pos + 1] == '-' && s[pos + 2] == '>'))
++				pos++;
++			if (pos + 3 > len)
++				return len;
++			pos += 3;
++			continue;
++		}
++		break;
++	}
++	return pos;
++}
++
++/* Extract the top-level <key>IOPlatformUUID</key><string>...</string> value from
++ * /private/etc/darling-platform.plist so gethostuuid() matches IORegistry IOPlatformUUID. */
++static int parse_platform_plist_uuid(const char* xml, unsigned long len, unsigned char* uuid_buf)
++{
++	unsigned long pos = 0;
++	int dict_depth = 0;
++
++	while (pos < len)
++	{
++		if (xml[pos] != '<')
++		{
++			pos++;
++			continue;
++		}
++		if (pos + 4 <= len && xml[pos + 1] == '!' && xml[pos + 2] == '-' && xml[pos + 3] == '-')
++		{
++			pos = skip_ws_and_comments(xml, pos, len);
++			continue;
++		}
++
++		unsigned long gt = find_char(xml, pos + 1, len, '>');
++		if (gt >= len)
++			break;
++
++		const char* tag = xml + pos + 1;
++		unsigned long tlen = gt - (pos + 1);
++		int self_closing = (tlen > 0 && tag[tlen - 1] == '/');
++
++		if (!self_closing && span_eq(tag, tlen, "dict"))
++		{
++			dict_depth++;
++		}
++		else if (span_eq(tag, tlen, "/dict"))
++		{
++			if (dict_depth > 0)
++				dict_depth--;
++		}
++		else if (dict_depth == 1 && !self_closing && span_eq(tag, tlen, "key"))
++		{
++			unsigned long text_start = gt + 1;
++			unsigned long next_lt = find_char(xml, text_start, len, '<');
++			if (next_lt + 6 <= len && span_eq(xml + next_lt, 6, "</key>"))
++			{
++				unsigned long ks = text_start;
++				unsigned long ke = next_lt;
++				while (ks < ke && is_space(xml[ks]))
++					ks++;
++				while (ke > ks && is_space(xml[ke - 1]))
++					ke--;
++
++				pos = next_lt + 6;
++				if (!span_eq(xml + ks, ke - ks, "IOPlatformUUID"))
++					continue;
++
++				pos = skip_ws_and_comments(xml, pos, len);
++				if (pos + 8 > len || !span_eq(xml + pos, 8, "<string>"))
++					return -1;
++				unsigned long vs = pos + 8;
++				unsigned long val_lt = find_char(xml, vs, len, '<');
++				if (val_lt + 9 > len || !span_eq(xml + val_lt, 9, "</string>"))
++					return -1;
++				unsigned long ve = val_lt;
++				while (vs < ve && is_space(xml[vs]))
++					vs++;
++				while (ve > vs && is_space(xml[ve - 1]))
++					ve--;
++				return parse_uuid_str(xml + vs, ve - vs, uuid_buf);
++			}
++		}
++
++		pos = gt + 1;
++	}
++	return -1;
++}
++
++static int read_platform_uuid(unsigned char* uuid_buf)
++{
++	char plist[8192];
++	unsigned long total = 0;
++	int fd = sys_open_nocancel(RCLOL_PLATFORM_PLIST_PATH, BSD_O_RDONLY, 0);
++
++	if (fd < 0)
++		return -1;
++
++	while (total < sizeof(plist) - 1)
++	{
++		long got = sys_read_nocancel(fd, plist + total, (int) (sizeof(plist) - 1 - total));
++		if (got <= 0)
++			break;
++		total += (unsigned long) got;
++	}
++	close_internal(fd);
+ 
+-		v = hvalue(str[i*2]) << 4;
+-		v |= hvalue(str[i*2+1]);
++	if (total == 0)
++		return -1;
++	plist[total] = '\0';
++	return parse_platform_plist_uuid(plist, total, uuid_buf);
++}
+ 
+-		uuid_buf[i] = v;
++long sys_gethostuuid(unsigned char* uuid_buf, void* timeout)
++{
++	int ret, fd;
++	char buf[32];
++	int total = 0;
++
++	(void) timeout;
++	if (!uuid_buf)
++		return -EFAULT;
++
++	if (read_platform_uuid(uuid_buf) == 0)
++		return 0;
++
++	fd = sys_open_nocancel(RCLOL_MACHINE_ID_PATH, BSD_O_RDONLY, 0);
++	if (fd < 0)
++		return fd;
++
++	while (total < (int) sizeof(buf))
++	{
++		ret = (int) sys_read_nocancel(fd, buf + total, (int) sizeof(buf) - total);
++		if (ret < 0)
++		{
++			close_internal(fd);
++			return ret;
++		}
++		if (ret == 0)
++			break;
++		total += ret;
+ 	}
++	close_internal(fd);
++
++	if (total != (int) sizeof(buf))
++		return -ENOSYS;
++
++	if (hex2bin(buf, uuid_buf) != 0)
++		return -ENOSYS;
+ 
+ 	return 0;
+ }

@@ -37,10 +37,12 @@ SHIM = r"""
 #define _COMM_PAGE_THIS_VERSION       14
 #define _COMM_PAGE_CPU_CAPABILITIES   (_COMM_PAGE_START_ADDRESS+0x020)
 #define _COMM_PAGE_NCPUS              (_COMM_PAGE_START_ADDRESS+0x022)
+#define _COMM_PAGE_CACHE_LINESIZE     (_COMM_PAGE_START_ADDRESS+0x026)
 #define _COMM_PAGE_ACTIVE_CPUS        (_COMM_PAGE_START_ADDRESS+0x034)
 #define _COMM_PAGE_PHYSICAL_CPUS      (_COMM_PAGE_START_ADDRESS+0x035)
 #define _COMM_PAGE_LOGICAL_CPUS       (_COMM_PAGE_START_ADDRESS+0x036)
 #define _COMM_PAGE_MEMORY_SIZE        (_COMM_PAGE_START_ADDRESS+0x038)
+#define _COMM_PAGE_CPUFAMILY          (_COMM_PAGE_START_ADDRESS+0x040)
 #define _COMM_PAGE_KERNEL_PAGE_SHIFT  (_COMM_PAGE_START_ADDRESS+0x04D)
 #define _COMM_PAGE_USER_PAGE_SHIFT_64 (_COMM_PAGE_START_ADDRESS+0x04E)
 #define _COMM_PAGE_USER_PAGE_SHIFT_32 _COMM_PAGE_USER_PAGE_SHIFT_64
@@ -62,10 +64,16 @@ int main(void) {
      * would be overkill: the fixed address is free in this tiny process. */
     commpage_setup(true);
     const uint8_t* page = (const uint8_t*) 0x00007fffffe00000ULL;
-    uint64_t memory;
+    uint64_t memory, caps64;
+    uint16_t cacheline;
+    uint32_t cpufamily;
+    memcpy(&caps64, page + 0x10, sizeof(caps64));
+    memcpy(&cacheline, page + 0x26, sizeof(cacheline));
     memcpy(&memory, page + 0x38, sizeof(memory));
-    printf("%u %u %u %u %llu\n", page[0x22], page[0x34], page[0x35], page[0x36],
-           (unsigned long long) memory);
+    memcpy(&cpufamily, page + 0x40, sizeof(cpufamily));
+    printf("%u %u %u %u %llu %u 0x%x 0x%llx\n", page[0x22], page[0x34], page[0x35], page[0x36],
+           (unsigned long long) memory, (unsigned) cacheline, (unsigned) cpufamily,
+           (unsigned long long) caps64);
     return 0;
 }
 """
@@ -80,8 +88,11 @@ def host_memory():
 
 def run(binary, env):
     out = subprocess.run([str(binary)], env=env, check=True, capture_output=True, text=True).stdout
-    ncpus, active, physical, logical, memory = (int(v) for v in out.split())
-    return ncpus, active, physical, logical, memory
+    parts = out.split()
+    ncpus, active, physical, logical, memory, cacheline = (int(v) for v in parts[:6])
+    cpufamily = int(parts[6], 16)
+    caps64 = int(parts[7], 16)
+    return ncpus, active, physical, logical, memory, cacheline, cpufamily, caps64
 
 
 def main():
@@ -121,11 +132,11 @@ def main():
     profile_memory = 16 << 30
     got = run(binary, dict(base, RCLOL_PLATFORM_PROFILE='compat',
                            RCLOL_MEMORY_BYTES=str(profile_memory)))
-    want = (12, 12, 6, 12, profile_memory)
+    want = (12, 12, 6, 12, profile_memory, 64, 0x0f817246)
     print(f'COMMPAGE mode=compat ncpus={got[0]} active={got[1]} physical={got[2]} '
-          f'logical={got[3]} memory={got[4]}')
-    if got != want:
-        failures.append(f'compat: got {got}, want {want}')
+          f'logical={got[3]} memory={got[4]} cacheline={got[5]} cpufamily=0x{got[6]:08x}')
+    if got[:7] != want or not (got[7] & 0x20):
+        failures.append(f'compat: got {got}, want {want} with kCache64')
 
     # Not a plain decimal number: the host's size stays, as in xnu.
     got = run(binary, dict(base, RCLOL_PLATFORM_PROFILE='compat',
@@ -147,8 +158,8 @@ def main():
     got = run(binary, base)
     online = os.cpu_count()
     print(f'COMMPAGE mode=host ncpus={got[0]} active={got[1]} physical={got[2]} '
-          f'logical={got[3]} memory={got[4]}')
-    if got[0] != online or got[4] != host_memory():
+          f'logical={got[3]} memory={got[4]} cacheline={got[5]} cpufamily=0x{got[6]:08x}')
+    if got[0] != online or got[4] != host_memory() or got[5] not in (32, 64, 128):
         failures.append(f'host: got {got}, want ncpus={online} memory={host_memory()}')
 
     if failures:

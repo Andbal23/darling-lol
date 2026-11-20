@@ -8758,10 +8758,10 @@ index f5ba615..53d04ad 100644
  	if (shell_pid != -1)
  		kill(shell_pid, SIGKILL);
 diff --git a/src/startup/mldr/commpage.c b/src/startup/mldr/commpage.c
-index d9a7aea96..bfb6ce45d 100644
+index d9a7aea9..26ac75d0 100644
 --- a/src/startup/mldr/commpage.c
 +++ b/src/startup/mldr/commpage.c
-@@ -12,6 +12,12 @@
+@@ -12,11 +12,19 @@
  // Include commpage definitions
  #define PRIVATE
  #include <i386/cpu_capabilities.h>
@@ -8774,7 +8774,23 @@ index d9a7aea96..bfb6ce45d 100644
  
  static const char* SIGNATURE32 = "commpage 32-bit";
  static const char* SIGNATURE64 = "commpage 64-bit";
-@@ -60,6 +66,24 @@ void commpage_setup(bool _64bit)
+ 
+ static uint64_t get_cpu_caps(void);
++static uint16_t host_cache_line_size(void);
++static uint32_t host_cpufamily(void);
+ 
+ #define CGET(p) (commpage + ((p)-_COMM_PAGE_START_ADDRESS))
+ 
+@@ -26,6 +34,8 @@ void commpage_setup(bool _64bit)
+ 	uint64_t* cpu_caps64;
+ 	uint32_t* cpu_caps;
+ 	uint16_t* version;
++	uint16_t* cache_linesize;
++	uint32_t* cpufamily;
+ 	char* signature;
+ 	uint64_t my_caps;
+ 	uint8_t *ncpus, *nactivecpus;
+@@ -60,6 +70,24 @@ void commpage_setup(bool _64bit)
  	logcpus = (uint8_t*)CGET(_COMM_PAGE_LOGICAL_CPUS);
  	*physcpus = *logcpus = *ncpus;
  
@@ -8799,7 +8815,7 @@ index d9a7aea96..bfb6ce45d 100644
  	// I'm not sure if Linux has separate page sizes for kernel and user space.
  	// Apple's code uses left shift logical (1 << user_page_shift) to get the page size value.
  	// Since it's very unlikely that the page size won't be a power of 2, we can use __builtin_ctzl()
-@@ -71,6 +95,10 @@ void commpage_setup(bool _64bit)
+@@ -71,87 +99,100 @@ void commpage_setup(bool _64bit)
  	my_caps = get_cpu_caps();
  	if (*ncpus == 1)
  		my_caps |= kUP;
@@ -8807,10 +8823,21 @@ index d9a7aea96..bfb6ce45d 100644
 +	// Apple's libc reads as kNumCPUs (bits 16-23). Writing the word without it
 +	// left NCPUS at 0 on every profile.
 +	my_caps |= ((uint64_t) *ncpus) << kNumCPUsShift;
++
++	cache_linesize = (uint16_t*)CGET(_COMM_PAGE_CACHE_LINESIZE);
++	*cache_linesize = compat_profile ? 64 : host_cache_line_size();
++	if (*cache_linesize == 64)
++		my_caps |= kCache64;
++	else if (*cache_linesize == 128)
++		my_caps |= kCache128;
  
  	*cpu_caps = (uint32_t) my_caps;
  	*cpu_caps64 = my_caps;
-@@ -79,79 +107,55 @@ void commpage_setup(bool _64bit)
+ 
++	cpufamily = (uint32_t*)CGET(_COMM_PAGE_CPUFAMILY);
++	*cpufamily = compat_profile ? 0x0f817246u /* CPUFAMILY_INTEL_KABYLAKE */ : host_cpufamily();
++
+ 	if (sysinfo(&si) == 0)
  	{
  		uint64_t* memsize = (uint64_t*)CGET(_COMM_PAGE_MEMORY_SIZE);
  		*memsize = si.totalram * si.mem_unit;
@@ -8844,7 +8871,28 @@ index d9a7aea96..bfb6ce45d 100644
  uint64_t get_cpu_caps(void)
  {
 -	uint64_t caps = 0;
--
++    unsigned int a, b, ecx1 = 0, edx1 = 0, ebx7 = 0;
++    const unsigned int max_basic = __get_cpuid_max(0, NULL);
++    if (max_basic >= 1) __cpuid_count(1, 0, a, b, ecx1, edx1);
++    if (max_basic >= 7) {
++        unsigned int c, d;
++        __cpuid_count(7, 0, a, ebx7, c, d);
++    }
++    uint64_t xcr0 = 0;
++    if ((ecx1 & ((1u << 26) | (1u << 27))) == ((1u << 26) | (1u << 27))) {
++        unsigned int low, high;
++        __asm__ volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
++        xcr0 = ((uint64_t)high << 32) | low;
++    }
++    int long_mode = 0;
++    if (__get_cpuid_max(0x80000000u, NULL) >= 0x80000001u) {
++        unsigned int c, d;
++        __cpuid_count(0x80000001u, 0, a, b, c, d);
++        long_mode = !!(d & (1u << 29));
++    }
++    return commpage_decode_cpu_caps(ecx1, edx1, ebx7, xcr0, long_mode);
++}
+ 
 -	{
 -		union cpu_flags1 eax;
 -		union cpu_flags2 ecx;
@@ -8909,28 +8957,28 @@ index d9a7aea96..bfb6ce45d 100644
 -		if (ebx.sgx)
 -			caps |= kHasSGX;
 -	}
--
++static uint16_t host_cache_line_size(void)
++{
++    unsigned int a = 0, b = 0, c = 0, d = 0;
++    if (__get_cpuid_max(0, NULL) >= 1) {
++        __cpuid_count(1, 0, a, b, c, d);
++        unsigned int bytes = ((b >> 8) & 0xffu) * 8u;
++        if (bytes == 32u || bytes == 64u || bytes == 128u)
++            return (uint16_t) bytes;
++    }
++    return 64u;
++}
+ 
 -	return caps;
-+    unsigned int a, b, ecx1 = 0, edx1 = 0, ebx7 = 0;
-+    const unsigned int max_basic = __get_cpuid_max(0, NULL);
-+    if (max_basic >= 1) __cpuid_count(1, 0, a, b, ecx1, edx1);
-+    if (max_basic >= 7) {
-+        unsigned int c, d;
-+        __cpuid_count(7, 0, a, ebx7, c, d);
-+    }
-+    uint64_t xcr0 = 0;
-+    if ((ecx1 & ((1u << 26) | (1u << 27))) == ((1u << 26) | (1u << 27))) {
-+        unsigned int low, high;
-+        __asm__ volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
-+        xcr0 = ((uint64_t)high << 32) | low;
-+    }
-+    int long_mode = 0;
-+    if (__get_cpuid_max(0x80000000u, NULL) >= 0x80000001u) {
-+        unsigned int c, d;
-+        __cpuid_count(0x80000001u, 0, a, b, c, d);
-+        long_mode = !!(d & (1u << 29));
-+    }
-+    return commpage_decode_cpu_caps(ecx1, edx1, ebx7, xcr0, long_mode);
++static uint32_t host_cpufamily(void)
++{
++    unsigned int a = 0, b = 0, c = 0, d = 0;
++    if (__get_cpuid_max(0, NULL) < 1)
++        return 0u;
++    __cpuid_count(0, 0, a, b, c, d);
++    int is_intel = (b == 0x756e6547u && d == 0x49656e69u && c == 0x6c65746eu);
++    __cpuid_count(1, 0, a, b, c, d);
++    return commpage_intel_cpufamily(is_intel, a);
  }
  
  unsigned long commpage_address(bool _64bit)
@@ -10493,9 +10541,10 @@ new file mode 100644
 +#endif
 diff --git a/src/startup/mldr/commpage-cpu-caps.h b/src/startup/mldr/commpage-cpu-caps.h
 new file mode 100644
+index 00000000..b90e82f3
 --- /dev/null
 +++ b/src/startup/mldr/commpage-cpu-caps.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,80 @@
 +#ifndef MLDR_COMMPAGE_CPU_CAPS_H
 +#define MLDR_COMMPAGE_CPU_CAPS_H
 +#include <stdint.h>
@@ -10535,6 +10584,45 @@ new file mode 100644
 +    FEATURE(ebx7, 2, kHasSGX);
 +#undef FEATURE
 +    return caps;
++}
++
++/* Decode XNU hw.cpufamily / _COMM_PAGE_CPUFAMILY from a CPUID leaf 1 EAX
++ * signature (0 if unknown or non-Intel). Mirrors xnu osfmk/i386/cpuid.c. */
++static inline uint32_t commpage_intel_cpufamily(int vendor_is_intel, uint32_t signature)
++{
++    uint32_t base_family = (signature >> 8) & 0xfu;
++    uint32_t ext_family = (signature >> 20) & 0xffu;
++    uint32_t family = (base_family == 0xfu) ? (base_family + ext_family) : base_family;
++    uint32_t base_model = (signature >> 4) & 0xfu;
++    uint32_t ext_model = (signature >> 16) & 0xfu;
++    uint32_t model = (ext_model << 4) | base_model;
++
++    if (!vendor_is_intel || family != 6u)
++        return 0u;
++
++    switch (model) {
++        case 0x17: return 0x78ea4fbcu;
++        case 0x1a: case 0x1e: case 0x1f: case 0x2e:
++            return 0x6b5a4cd2u;
++        case 0x25: case 0x2c: case 0x2f:
++            return 0x573b5eecu;
++        case 0x2a: case 0x2d:
++            return 0x5490b78cu;
++        case 0x3a: case 0x3e:
++            return 0x1f65e835u;
++        case 0x3c: case 0x3f: case 0x45: case 0x46:
++            return 0x10b282dcu;
++        case 0x3d: case 0x47:
++            return 0x582ed09cu;
++        case 0x4e: case 0x55: case 0x5e:
++            return 0x37fc219fu;
++        case 0x8e: case 0x9e:
++            return 0x0f817246u;
++        case 0x7d: case 0x7e: case 0x9f:
++            return 0x38435547u;
++        default:
++            return 0u;
++    }
 +}
 +#endif
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
